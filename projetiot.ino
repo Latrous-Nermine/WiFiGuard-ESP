@@ -10,16 +10,14 @@ extern "C" {
 // ==================== CONFIGURATION ====================
 #define SSID "Tunisie_Telecom-2.4G-2057"
 #define PASS "W9793bb32b"
-#define PC_IP "192.168.1.249"
+#define PC_IP "192.168.1.247"
 #define PC_PORT 5000
 
 #define MAX_DEVICES 30
-#define ARP_PING_DELAY 8
-#define ARP_WAIT_TIME 2500
-#define PORT_SCAN_TIMEOUT 40
+#define ARP_PING_DELAY 15
+#define ARP_WAIT_TIME 3000
+#define PORT_SCAN_TIMEOUT 150
 #define SCAN_PASSES 3
-#define MAX_ATTACKERS 10
-#define HISTORY_SIZE 20
 
 // ==================== SERVEUR WEB ====================
 ESP8266WebServer server(80);
@@ -30,8 +28,15 @@ struct Device {
   uint8_t mac[6];
   uint8_t port;
   char type;
+  
+  // ✅ Ports normaux (services standards)
   uint16_t openPorts[10];
   uint8_t openPortCount;
+  
+  // ✅ NOUVEAU : Ports suspects (backdoors, trojans)
+  uint16_t suspiciousPorts[10];
+  uint8_t suspiciousPortCount;
+  
   unsigned long lastSeen;
   uint16_t scanAttempts;
 };
@@ -43,22 +48,9 @@ struct ARPCache {
   bool active;
 };
 
-struct AttackerProfile {
+struct PacketSource {
   uint8_t mac[6];
-  unsigned long deauthSent;
-  unsigned long probesSent;
-  unsigned long eapolSent;
-  unsigned long arpSent;
-  unsigned long beaconsSent;
-  unsigned long lastSeen;
-  bool suspicious;
-};
-
-struct FrameHistory {
-  uint16_t seqNum;
-  uint8_t srcMAC[6];
-  unsigned long timestamp;
-  bool wasRetry;
+  unsigned long count;
 };
 
 typedef struct {
@@ -95,97 +87,42 @@ typedef struct {
 // ==================== VARIABLES GLOBALES ====================
 Device devices[MAX_DEVICES];
 ARPCache arpCache[MAX_DEVICES];
-AttackerProfile attackers[MAX_ATTACKERS];
-FrameHistory frameHistory[HISTORY_SIZE];
+PacketSource topSources[10];
 
 uint8_t deviceCount = 0;
 uint8_t cacheSize = 0;
-uint8_t attackerCount = 0;
-uint8_t historyIndex = 0;
+uint8_t topSourceCount = 0;
 
 bool scanning = false;
 bool isSniffing = false;
 unsigned long scanStartTime = 0;
 unsigned long snifferStartTime = 0;
 
-unsigned long packetCount[256] = {0};
 unsigned long totalPacketsCaptured = 0;
 
-unsigned long deauthFrames = 0;
-unsigned long disassocFrames = 0;
-unsigned long authFrames = 0;
-unsigned long beaconFrames = 0;
-unsigned long probeRequests = 0;
-unsigned long probeResponses = 0;
-unsigned long eapolFrames = 0;
-unsigned long arpRequests = 0;
-unsigned long sequentialDeauth = 0;
-unsigned long broadcastDeauth = 0;
-unsigned long duplicateFrames = 0;
-unsigned long fragmentedFrames = 0;
-unsigned long wpsProbes = 0;
-unsigned long eapStartFrames = 0;
-unsigned long managementFrames = 0;
-unsigned long dataFrames = 0;
-unsigned long controlFrames = 0;
-
-unsigned long lastDeauthTime = 0;
-uint8_t lastDeauthSrcMAC[6] = {0};
-
 // ==================== FONCTIONS HELPER ====================
-void ICACHE_RAM_ATTR trackAttacker(uint8_t *mac, uint8_t attackType) {
-  for (uint8_t i = 0; i < attackerCount; i++) {
-    if (memcmp(attackers[i].mac, mac, 6) == 0) {
-      switch (attackType) {
-        case 0: attackers[i].deauthSent++; break;
-        case 1: attackers[i].probesSent++; break;
-        case 2: attackers[i].eapolSent++; break;
-        case 3: attackers[i].arpSent++; break;
-        case 4: attackers[i].beaconsSent++; break;
-      }
-      attackers[i].lastSeen = millis();
-      
-      if (attackers[i].deauthSent > 50 || attackers[i].probesSent > 200 ||
-          attackers[i].eapolSent > 20 || attackers[i].arpSent > 100 ||
-          attackers[i].beaconsSent > 500) {
-        attackers[i].suspicious = true;
+void ICACHE_RAM_ATTR trackTopSource(uint8_t *mac) {
+  for (uint8_t i = 0; i < topSourceCount; i++) {
+    if (memcmp(topSources[i].mac, mac, 6) == 0) {
+      topSources[i].count++;
+      while (i > 0 && topSources[i].count > topSources[i-1].count) {
+        PacketSource temp = topSources[i];
+        topSources[i] = topSources[i-1];
+        topSources[i-1] = temp;
+        i--;
       }
       return;
     }
   }
   
-  if (attackerCount < MAX_ATTACKERS) {
-    memcpy(attackers[attackerCount].mac, mac, 6);
-    attackers[attackerCount].deauthSent = (attackType == 0) ? 1 : 0;
-    attackers[attackerCount].probesSent = (attackType == 1) ? 1 : 0;
-    attackers[attackerCount].eapolSent = (attackType == 2) ? 1 : 0;
-    attackers[attackerCount].arpSent = (attackType == 3) ? 1 : 0;
-    attackers[attackerCount].beaconsSent = (attackType == 4) ? 1 : 0;
-    attackers[attackerCount].lastSeen = millis();
-    attackers[attackerCount].suspicious = false;
-    attackerCount++;
+  if (topSourceCount < 10) {
+    memcpy(topSources[topSourceCount].mac, mac, 6);
+    topSources[topSourceCount].count = 1;
+    topSourceCount++;
+  } else {
+    memcpy(topSources[9].mac, mac, 6);
+    topSources[9].count = 1;
   }
-}
-
-bool ICACHE_RAM_ATTR isDuplicateFrame(uint16_t seqNum, uint8_t *srcMAC, bool isRetry) {
-  for (uint8_t i = 0; i < HISTORY_SIZE; i++) {
-    if (frameHistory[i].seqNum == seqNum && 
-        memcmp(frameHistory[i].srcMAC, srcMAC, 6) == 0) {
-      if (millis() - frameHistory[i].timestamp < 1000) {
-        if (isRetry && frameHistory[i].wasRetry) return false;
-        if (!isRetry && !frameHistory[i].wasRetry) return true;
-        return true;
-      }
-    }
-  }
-  
-  frameHistory[historyIndex].seqNum = seqNum;
-  memcpy(frameHistory[historyIndex].srcMAC, srcMAC, 6);
-  frameHistory[historyIndex].timestamp = millis();
-  frameHistory[historyIndex].wasRetry = isRetry;
-  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
-  
-  return false;
 }
 
 // ==================== CALLBACK SNIFFER ====================
@@ -199,124 +136,29 @@ void ICACHE_RAM_ATTR packetSnifferCallback(uint8_t *buffer, uint16_t length) {
   
   uint16_t frameControl = ((uint16_t)packet[1] << 8) | packet[0];
   uint8_t frameType = (frameControl >> 2) & 0x03;
-  uint8_t frameSubtype = (frameControl >> 4) & 0x0F;
   bool toDS = (frameControl >> 8) & 0x01;
   bool fromDS = (frameControl >> 9) & 0x01;
-  bool moreFrag = (frameControl >> 10) & 0x01;
-  bool retry = (frameControl >> 11) & 0x01;
   
-  uint16_t seqCtrl = ((uint16_t)packet[23] << 8) | packet[22];
-  uint16_t seqNum = seqCtrl >> 4;
-  uint8_t fragNum = seqCtrl & 0x0F;
-  
-  uint8_t destMAC[6], srcMAC[6], bssid[6];
+  uint8_t srcMAC[6];
   
   if (frameType == 0) {
-    managementFrames++;
-    memcpy(destMAC, &packet[4], 6);
     memcpy(srcMAC, &packet[10], 6);
-    memcpy(bssid, &packet[16], 6);
-    
-    if (isDuplicateFrame(seqNum, srcMAC, retry)) duplicateFrames++;
-    if (moreFrag || fragNum > 0) fragmentedFrames++;
-    
-    switch (frameSubtype) {
-      case 0x0B:
-        authFrames++;
-        if (authFrames > 100) trackAttacker(srcMAC, 0);
-        break;
-        
-      case 0x0C: {
-        deauthFrames++;
-        trackAttacker(srcMAC, 0);
-        if (destMAC[0] == 0xFF && destMAC[1] == 0xFF) broadcastDeauth++;
-        unsigned long now = millis();
-        if (memcmp(srcMAC, lastDeauthSrcMAC, 6) == 0 && now - lastDeauthTime < 100) {
-          sequentialDeauth++;
-        }
-        lastDeauthTime = now;
-        memcpy(lastDeauthSrcMAC, srcMAC, 6);
-        break;
-      }
-        
-      case 0x0A:
-        disassocFrames++;
-        trackAttacker(srcMAC, 0);
-        break;
-        
-      case 0x08:
-        beaconFrames++;
-        if (beaconFrames > 500) trackAttacker(srcMAC, 4);
-        break;
-        
-      case 0x04: {
-        probeRequests++;
-        uint8_t offset = 24;
-        while (offset + 2 < length) {
-          uint8_t ieType = packet[offset];
-          uint8_t ieLen = packet[offset + 1];
-          if (offset + 2 + ieLen > length) break;
-          
-          if (ieType == 0xDD && ieLen >= 4) {
-            if (packet[offset + 2] == 0x00 && packet[offset + 3] == 0x50 && 
-                packet[offset + 4] == 0xF2 && packet[offset + 5] == 0x04) {
-              wpsProbes++;
-              trackAttacker(srcMAC, 1);
-            }
-          }
-          offset += 2 + ieLen;
-        }
-        if (probeRequests > 300) trackAttacker(srcMAC, 1);
-        break;
-      }
-        
-      case 0x05:
-        probeResponses++;
-        break;
-    }
-  }
-  else if (frameType == 2) {
-    dataFrames++;
-    
+  } else if (frameType == 2) {
     if (!toDS && !fromDS) {
-      memcpy(destMAC, &packet[4], 6);
       memcpy(srcMAC, &packet[10], 6);
-      memcpy(bssid, &packet[16], 6);
     } else if (toDS && !fromDS) {
-      memcpy(bssid, &packet[4], 6);
       memcpy(srcMAC, &packet[10], 6);
-      memcpy(destMAC, &packet[16], 6);
     } else if (!toDS && fromDS) {
-      memcpy(destMAC, &packet[4], 6);
-      memcpy(bssid, &packet[10], 6);
+      memcpy(srcMAC, &packet[16], 6);
+    } else {
       memcpy(srcMAC, &packet[16], 6);
     }
-    
-    packetCount[srcMAC[5]]++;
-    if (isDuplicateFrame(seqNum, srcMAC, retry)) duplicateFrames++;
-    
-    uint16_t offset = 24;
-    if (frameSubtype == 0x08) offset += 2;
-    
-    if (length > offset + 8) {
-      if (packet[offset] == 0xAA && packet[offset+1] == 0xAA && 
-          packet[offset+2] == 0x03 && packet[offset+6] == 0x88 && 
-          packet[offset+7] == 0x8E) {
-        eapolFrames++;
-        trackAttacker(srcMAC, 2);
-        uint8_t *eapol = &packet[offset + 8];
-        if (length > offset + 12 && eapol[1] == 0) eapStartFrames++;
-      }
-      else if (packet[offset] == 0xAA && packet[offset+1] == 0xAA && 
-               packet[offset+2] == 0x03 && packet[offset+6] == 0x08 && 
-               packet[offset+7] == 0x06) {
-        arpRequests++;
-        trackAttacker(srcMAC, 3);
-      }
-    }
+  } else {
+    return;
   }
-  else if (frameType == 1) {
-    controlFrames++;
+  
+  if ((srcMAC[0] & 0x01) == 0) {
+    trackTopSource(srcMAC);
   }
 }
 
@@ -382,26 +224,99 @@ bool getARPEntry(IPAddress ip, uint8_t* mac) {
   return false;
 }
 
-// ==================== SCAN PORTS ====================
+// ==================== SCAN PORTS NORMAUX ====================
 void scanPortsQuick(IPAddress ip, Device &device) {
   WiFiClient client;
   client.setTimeout(PORT_SCAN_TIMEOUT);
+  
+  // ✅ RESET AVANT SCAN
   device.openPortCount = 0;
   device.scanAttempts = 0;
+  memset(device.openPorts, 0, sizeof(device.openPorts));
   
-  uint16_t ports[] = {80, 443, 22, 445, 3389, 8080};
+  // Ports standards à scanner
+  uint16_t ports[] = {21, 22, 23, 80, 443, 445, 993, 995, 1433, 3306, 3389, 5432, 5900, 8080};
+  uint8_t portCount = sizeof(ports) / sizeof(ports[0]);
   
-  for (uint8_t i = 0; i < 6 && device.openPortCount < 10; i++) {
+  for (uint8_t i = 0; i < portCount && device.openPortCount < 10; i++) {
     device.scanAttempts++;
+    
     if (client.connect(ip, ports[i])) {
       device.openPorts[device.openPortCount++] = ports[i];
       client.stop();
-      delay(3);
+      delay(5);
     }
+    
     yield();
   }
 }
 
+// ==================== SCAN PORTS SUSPECTS ====================
+void scanSuspiciousPorts(IPAddress ip, Device &device) {
+  WiFiClient client;
+  client.setTimeout(PORT_SCAN_TIMEOUT);
+  
+  // ✅ Reset les ports SUSPECTS uniquement
+  device.suspiciousPortCount = 0;
+  memset(device.suspiciousPorts, 0, sizeof(device.suspiciousPorts));
+  
+  // ✅ LISTE DES PORTS SUSPECTS
+  uint16_t suspiciousPorts[] = {
+    // === BACKDOORS & TROJANS (CRITICAL) ===
+    31337,  // Back Orifice
+    12345,  // NetBus
+    27374,  // SubSeven
+    54321,  // Back Orifice 2000
+    6666,   // Beast trojan
+    1243,   // SubSeven
+    6667,   // IRC (botnet)
+    
+    // === OUTILS DE HACK (HIGH) ===
+    4444,   // Metasploit default
+    5555,   // Android ADB / HP Data Protector (exploité)
+    8888,   // Alt HTTP (suspect)
+    9999,   // Hidden port
+    1337,   // Elite/Leet
+    
+    // === SERVICES VULNÉRABLES (MEDIUM) ===
+    2222,   // SSH alternatif (backdoor possible)
+    10000,  // Webmin (souvent exploité)
+    
+    // === BASE DE DONNÉES EXPOSÉES (HIGH) ===
+    3306,   // MySQL (ne devrait pas être exposé)
+    5432,   // PostgreSQL (ne devrait pas être exposé)
+    1433    // MS SQL Server (ne devrait pas être exposé)
+  };
+  
+  uint8_t portCount = sizeof(suspiciousPorts) / sizeof(suspiciousPorts[0]);
+  
+  // Scanner chaque port suspect
+  for (uint8_t i = 0; i < portCount && device.suspiciousPortCount < 10; i++) {
+    if (client.connect(ip, suspiciousPorts[i])) {
+      device.suspiciousPorts[device.suspiciousPortCount++] = suspiciousPorts[i];
+      client.stop();
+      delay(5);
+    }
+    
+    yield();
+  }
+  
+  // Log si ports suspects trouvés
+  if (device.suspiciousPortCount > 0) {
+    Serial.print("   ⚠️  ");
+    Serial.print(ip);
+    Serial.print(" : ");
+    Serial.print(device.suspiciousPortCount);
+    Serial.print(" port(s) suspect(s) → [");
+    for (uint8_t i = 0; i < device.suspiciousPortCount; i++) {
+      Serial.print(device.suspiciousPorts[i]);
+      if (i < device.suspiciousPortCount - 1) Serial.print(", ");
+    }
+    Serial.println("]");
+  }
+}
+
+// ==================== DÉTECTION TYPE ====================
 char detectDeviceType(IPAddress ip, uint8_t* mac, uint8_t &port) {
   WiFiClient client;
   client.setTimeout(PORT_SCAN_TIMEOUT);
@@ -414,7 +329,7 @@ char detectDeviceType(IPAddress ip, uint8_t* mac, uint8_t &port) {
   if (client.connect(ip, 3389)) { client.stop(); port = 3389; return 'R'; }
   
   port = 0;
-  return 'SmartPhone/TV';
+  return 'U';
 }
 
 // ==================== SCAN RÉSEAU ====================
@@ -425,52 +340,85 @@ void performScan() {
   deviceCount = 0;
   scanStartTime = millis();
   
-  Serial.println("\n╔════════════════════════════════════╗");
-  Serial.println("║  SCAN RÉSEAU v4.1 OPTIMISÉ        ║");
-  Serial.println("╚════════════════════════════════════╝");
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║  SCAN RÉSEAU (CACHE ARP)              ║");
+  Serial.println("╚════════════════════════════════════════╝");
   
   IPAddress localIP = WiFi.localIP();
   uint8_t base[3] = {localIP[0], localIP[1], localIP[2]};
   
-  Serial.printf("📍 %d.%d.%d.0/24 | 📡 %s | 💾 %d cache\n", 
-                base[0], base[1], base[2], localIP.toString().c_str(), cacheSize);
+  Serial.printf("📍 Réseau: %d.%d.%d.0/24\n", base[0], base[1], base[2]);
+  Serial.printf("📡 ESP IP: %s\n", localIP.toString().c_str());
+  Serial.printf("💾 Cache: %d entrées\n\n", cacheSize);
   
-  // Cache
+  // ÉTAPE 1 : SCAN CACHE
   if (cacheSize > 0) {
-    Serial.println("\n[1/4] 💾 Cache...");
+    Serial.println("═══ [1/5] 💾 SCAN CACHE ═══");
     for (uint8_t i = 0; i < cacheSize; i++) {
       if (!arpCache[i].active) continue;
+      
       IPAddress target(base[0], base[1], base[2], arpCache[i].ip);
-      for (uint8_t r = 0; r < 3; r++) { arpPing(target); delay(10); }
+      for (uint8_t r = 0; r < 3; r++) {
+        arpPing(target);
+        delay(10);
+      }
+      server.handleClient();
       yield();
     }
-    delay(1500);
+    delay(1000);
+    Serial.println("   ✅ Cache scanné\n");
   }
   
-  // IPs prioritaires
-  Serial.println("\n[2/4] 🚀 Prioritaires...");
-  uint8_t priority[] = {1, 100, 249, 250, 251, 252, 253, 254};
+  // ÉTAPE 2 : IPS PRIORITAIRES
+  Serial.println("═══ [2/5] 🚀 IPS PRIORITAIRES ═══");
+  uint8_t priority[] = {1, 248, 254, 253, 100, 101, 102};
+  
   for (uint8_t i = 0; i < sizeof(priority); i++) {
     if (priority[i] == localIP[3]) continue;
+    
     IPAddress target(base[0], base[1], base[2], priority[i]);
-    for (uint8_t r = 0; r < 3; r++) { arpPing(target); delay(ARP_PING_DELAY); }
+    for (uint8_t r = 0; r < 3; r++) {
+      arpPing(target);
+      delay(ARP_PING_DELAY);
+    }
+    server.handleClient();
     yield();
   }
   delay(ARP_WAIT_TIME);
+  Serial.println("   ✅ IPs prioritaires scannées\n");
   
-  // Scan complet
-  Serial.println("\n[3/4] 📡 Scan...");
+  // ÉTAPE 3 : SCAN COMPLET
+  Serial.printf("═══ [3/5] 📡 SCAN COMPLET (%d passes) ═══\n", SCAN_PASSES);
+  
   for (uint8_t pass = 1; pass <= SCAN_PASSES; pass++) {
+    Serial.printf("   🔄 Passe %d/%d...\n", pass, SCAN_PASSES);
+    
     for (uint8_t i = 1; i <= 254; i++) {
       if (i == localIP[3]) continue;
-      arpPing(IPAddress(base[0], base[1], base[2], i));
-      if (i % (pass == 1 ? 8 : 20) == 0) { delay(pass == 1 ? 10 : 20); yield(); }
+      
+      IPAddress target(base[0], base[1], base[2], i);
+      uint8_t pings = (pass == 1) ? 3 : 2;
+      for (uint8_t p = 0; p < pings; p++) {
+        arpPing(target);
+        delay(pass == 1 ? 12 : 8);
+      }
+      
+      if (i % 10 == 0) {
+        delay(pass == 1 ? 50 : 30);
+        server.handleClient();
+        yield();
+      }
     }
-    if (pass < SCAN_PASSES) delay(pass == 1 ? 2000 : 3000);
+    
+    if (pass < SCAN_PASSES) {
+      delay(pass == 1 ? 3000 : 2000);
+      server.handleClient();
+    }
   }
+  Serial.println("   ✅ Scan complet terminé\n");
   
-  // Lecture ARP
-  Serial.println("\n[4/4] 📖 ARP + Ports...");
+  // ==================== ÉTAPE 4 : LECTURE ARP + PORTS ====================
+  Serial.println("═══ [4/5] 📖 LECTURE ARP + PORTS ═══");
   delay(ARP_WAIT_TIME);
   
   for (uint8_t i = 1; i <= 254 && deviceCount < MAX_DEVICES; i++) {
@@ -481,64 +429,107 @@ void performScan() {
     
     if (getARPEntry(target, mac)) {
       bool exists = false;
+      
+      // Vérifier si l'appareil existe déjà
       for (uint8_t j = 0; j < deviceCount; j++) {
         if (devices[j].ip == i || memcmp(devices[j].mac, mac, 6) == 0) {
           exists = true;
           devices[j].lastSeen = millis();
+          
+          // ✅ Re-scanner les ports pour appareil existant
+          scanPortsQuick(target, devices[j]);
+          scanSuspiciousPorts(target, devices[j]);
+          
           break;
         }
       }
       
+      // Nouvel appareil trouvé
       if (!exists) {
         uint8_t port;
         char type = detectDeviceType(target, mac, port);
         
+        // Initialiser le nouveau device
         devices[deviceCount].ip = i;
         memcpy(devices[deviceCount].mac, mac, 6);
         devices[deviceCount].port = port;
         devices[deviceCount].type = type;
         devices[deviceCount].lastSeen = millis();
         devices[deviceCount].openPortCount = 0;
+        devices[deviceCount].suspiciousPortCount = 0;  // ✅ NOUVEAU
         devices[deviceCount].scanAttempts = 0;
         
+        // ✅ Scanner les ports normaux
         scanPortsQuick(target, devices[deviceCount]);
         
-        Serial.printf("   ✅ .%d | %02X:%02X:...:%02X | %c | %d ports\n",
-                      i, mac[0], mac[1], mac[5], type, devices[deviceCount].openPortCount);
+        // ✅ Scanner les ports suspects
+        scanSuspiciousPorts(target, devices[deviceCount]);
+        
+        // Affichage dans Serial Monitor
+        Serial.print("   ✅ ");
+        Serial.print(target);
+        Serial.print(" | ");
+        
+        // MAC Address
+        for (int m = 0; m < 6; m++) {
+          if (mac[m] < 16) Serial.print("0");
+          Serial.print(mac[m], HEX);
+          if (m < 5) Serial.print(":");
+        }
+        
+        Serial.print(" | Type:");
+        Serial.print(type);
+        Serial.print(" | Ports:");
+        Serial.print(devices[deviceCount].openPortCount);
+        
+        // ✅ NOUVEAU : Afficher ports suspects
+        if (devices[deviceCount].suspiciousPortCount > 0) {
+          Serial.print(" | ⚠️ Suspects:");
+          Serial.print(devices[deviceCount].suspiciousPortCount);
+        }
+        
+        Serial.println();
         
         updateARPCache(i, mac);
         deviceCount++;
       }
+      
+      delay(50);
+      server.handleClient();
+      yield();
     }
-    yield();
   }
   
+  Serial.println();
+  
+  // ÉTAPE 5 : FINALISATION
+  Serial.println("═══ [5/5] 🧹 FINALISATION ═══");
   cleanupARPCache();
   
   unsigned long duration = millis() - scanStartTime;
-  Serial.printf("\n✅ %d appareils en %lus | 💾 %d cache\n", deviceCount, duration/1000, cacheSize);
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.printf("║  ✅ SCAN TERMINÉ                       ║\n");
+  Serial.println("╠════════════════════════════════════════╣");
+  Serial.printf("║  📊 Appareils: %2d                     ║\n", deviceCount);
+  Serial.printf("║  ⏱️  Durée: %3lus                       ║\n", duration/1000);
+  Serial.printf("║  💾 Cache: %2d entrées                 ║\n", cacheSize);
+  Serial.println("╚════════════════════════════════════════╝\n");
   
   scanning = false;
 }
 
-// ==================== SNIFFER ====================
-void performPentestDetection() {
+// ==================== SNIFFER DDOS ====================
+void performDDoSDetection() {
   Serial.println("\n╔════════════════════════════════════╗");
-  Serial.println("║  SNIFFER PENTEST (20s)            ║");
+  Serial.println("║   DÉTECTION DDoS (20s)             ║");
   Serial.println("╚════════════════════════════════════╝");
   
-  memset(packetCount, 0, sizeof(packetCount));
-  memset(attackers, 0, sizeof(attackers));
-  memset(frameHistory, 0, sizeof(frameHistory));
+  memset(topSources, 0, sizeof(topSources));
+  totalPacketsCaptured = 0;
+  topSourceCount = 0;
   
-  totalPacketsCaptured = deauthFrames = disassocFrames = authFrames = 0;
-  beaconFrames = probeRequests = probeResponses = eapolFrames = 0;
-  arpRequests = sequentialDeauth = broadcastDeauth = duplicateFrames = 0;
-  fragmentedFrames = wpsProbes = eapStartFrames = 0;
-  managementFrames = dataFrames = controlFrames = 0;
-  attackerCount = historyIndex = 0;
-  
-  Serial.println("⚠️  Disconnect...");
+  Serial.println("⚠️  Déconnexion WiFi...");
   delay(1000);
   
   wifi_set_opmode(STATION_MODE);
@@ -549,31 +540,70 @@ void performPentestDetection() {
   isSniffing = true;
   snifferStartTime = millis();
   
-  Serial.println("🔍 Capture...");
+  Serial.println("🔍 Capture en cours (résolution via cache ARP)...");
   
   while (millis() - snifferStartTime < 20000) {
     delay(100);
     if ((millis() - snifferStartTime) % 5000 < 150) {
-      Serial.printf("📊 %lu pkt | Deauth:%lu | Probe:%lu | EAPOL:%lu | Dupl:%lu\n",
-                    totalPacketsCaptured, deauthFrames, probeRequests, eapolFrames, duplicateFrames);
+      Serial.printf("📊 %lu paquets capturés...\n", totalPacketsCaptured);
     }
   }
   
   isSniffing = false;
   wifi_promiscuous_enable(0);
   
-  Serial.printf("\n✅ %lu paquets | Mgmt:%lu Data:%lu Ctrl:%lu\n",
-                totalPacketsCaptured, managementFrames, dataFrames, controlFrames);
+  Serial.printf("\n✅ Total: %lu paquets (%lu pkt/s)\n", 
+                totalPacketsCaptured, totalPacketsCaptured / 20);
   
-  bool threat = false;
-  if (deauthFrames > 100) { Serial.println("🚨 AIREPLAY DEAUTH!"); threat = true; }
-  if (beaconFrames > 1000) { Serial.println("🚨 MDK3 FLOOD!"); threat = true; }
-  if (probeRequests > 500) { Serial.println("🚨 AIRODUMP SCAN!"); threat = true; }
-  if (wpsProbes > 20) { Serial.println("🚨 WASH/REAVER!"); threat = true; }
-  if (duplicateFrames > 1000) { Serial.println("🚨 REPLAY ATTACK!"); threat = true; }
-  if (!threat) Serial.println("✅ Aucune menace");
+  // Résolution via cache ARP
+  if (topSourceCount > 0) {
+    Serial.println("\n📡 Top 5 sources (résolution via cache ARP):");
+    for (uint8_t i = 0; i < topSourceCount && i < 5; i++) {
+      String ip = "EXTERNE";
+      bool resolved = false;
+      
+      for (uint8_t j = 0; j < deviceCount; j++) {
+        if (memcmp(devices[j].mac, topSources[i].mac, 6) == 0) {
+          IPAddress localIP = WiFi.localIP();
+          ip = String(localIP[0]) + "." + String(localIP[1]) + "." + 
+               String(localIP[2]) + "." + String(devices[j].ip);
+          resolved = true;
+          break;
+        }
+      }
+      
+      if (!resolved) {
+        for (uint8_t j = 0; j < cacheSize; j++) {
+          if (memcmp(arpCache[j].mac, topSources[i].mac, 6) == 0) {
+            IPAddress localIP = WiFi.localIP();
+            ip = String(localIP[0]) + "." + String(localIP[1]) + "." + 
+                 String(localIP[2]) + "." + String(arpCache[j].ip);
+            resolved = true;
+            break;
+          }
+        }
+      }
+      
+      Serial.printf("   %d. %02X:%02X:%02X:%02X:%02X:%02X | %s%s | %lu pkt (%.1f%%)\n",
+                    i+1,
+                    topSources[i].mac[0], topSources[i].mac[1], topSources[i].mac[2],
+                    topSources[i].mac[3], topSources[i].mac[4], topSources[i].mac[5],
+                    ip.c_str(),
+                    resolved ? " ✅" : "",
+                    topSources[i].count,
+                    (topSources[i].count * 100.0) / totalPacketsCaptured);
+    }
+  }
   
-  Serial.println("\n📡 Reconnexion...");
+  if (totalPacketsCaptured > 100000) {
+    Serial.println("\n🚨 ALERTE: Flood DDoS détecté!");
+  } else if (totalPacketsCaptured > 50000) {
+    Serial.println("\n⚠️  Trafic élevé détecté");
+  } else {
+    Serial.println("\n✅ Trafic normal");
+  }
+  
+  Serial.println("\n📡 Reconnexion WiFi...");
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASS);
   
@@ -589,90 +619,94 @@ void performPentestDetection() {
 // ==================== JSON ====================
 String buildJSON() {
   String json;
-  json.reserve(4500);
+  json.reserve(5000);
   
-  json = "{\"esp_ip\":\"" + WiFi.localIP().toString() + "\",";
+  IPAddress localIP = WiFi.localIP();
+  
+  json = "{\"esp_ip\":\"" + localIP.toString() + "\",";
   json += "\"scan_duration\":" + String(millis() - scanStartTime) + ",";
   json += "\"timestamp\":" + String(millis()) + ",";
   
-  json += "\"ddos_detection\":{\"total_packets\":" + String(totalPacketsCaptured);
+  json += "\"ddos_detection\":{";
+  json += "\"total_packets\":" + String(totalPacketsCaptured);
   json += ",\"packets_per_sec\":" + String(totalPacketsCaptured / 20);
-  json += ",\"capture_duration\":20000,\"top_sources\":[";
+  json += ",\"capture_duration\":20000";
+  json += ",\"top_sources\":[";
   
-  typedef struct { uint8_t idx; unsigned long cnt; } Src;
-  Src top[10] = {0};
-  
-  for (int i = 0; i < 256; i++) {
-    if (packetCount[i] > 0) {
-      for (int j = 0; j < 10; j++) {
-        if (packetCount[i] > top[j].cnt) {
-          for (int k = 9; k > j; k--) top[k] = top[k-1];
-          top[j].idx = i;
-          top[j].cnt = packetCount[i];
+  // Résolution via cache ARP dans JSON
+  for (uint8_t i = 0; i < topSourceCount && i < 10; i++) {
+    if (i > 0) json += ",";
+    
+    String sourceIP = "";
+    bool resolved = false;
+    
+    for (uint8_t j = 0; j < deviceCount; j++) {
+      if (memcmp(devices[j].mac, topSources[i].mac, 6) == 0) {
+        sourceIP = String(localIP[0]) + "." + String(localIP[1]) + "." + 
+                   String(localIP[2]) + "." + String(devices[j].ip);
+        resolved = true;
+        break;
+      }
+    }
+    
+    if (!resolved) {
+      for (uint8_t j = 0; j < cacheSize; j++) {
+        if (memcmp(arpCache[j].mac, topSources[i].mac, 6) == 0) {
+          sourceIP = String(localIP[0]) + "." + String(localIP[1]) + "." + 
+                     String(localIP[2]) + "." + String(arpCache[j].ip);
+          resolved = true;
           break;
         }
       }
     }
-  }
-  
-  for (int i = 0; i < 10 && top[i].cnt > 0; i++) {
-    if (i > 0) json += ",";
-    json += "{\"mac_suffix\":" + String(top[i].idx) + ",\"packet_count\":" + String(top[i].cnt) + "}";
+    
+    json += "{\"mac\":\"";
+    for (int j = 0; j < 6; j++) {
+      if (topSources[i].mac[j] < 16) json += "0";
+      json += String(topSources[i].mac[j], HEX);
+      if (j < 5) json += ":";
+    }
+    json += "\",\"ip\":\"" + sourceIP + "\"";
+    json += ",\"packet_count\":" + String(topSources[i].count);
+    json += ",\"percentage\":" + String((topSources[i].count * 100.0) / totalPacketsCaptured, 2);
+    json += "}";
   }
   json += "]},";
   
-  json += "\"wifi_pentest_detection\":{";
-  json += "\"deauth_frames\":" + String(deauthFrames);
-  json += ",\"disassoc_frames\":" + String(disassocFrames);
-  json += ",\"auth_frames\":" + String(authFrames);
-  json += ",\"beacon_frames\":" + String(beaconFrames);
-  json += ",\"probe_requests\":" + String(probeRequests);
-  json += ",\"eapol_frames\":" + String(eapolFrames);
-  json += ",\"arp_requests\":" + String(arpRequests);
-  json += ",\"sequential_deauth\":" + String(sequentialDeauth);
-  json += ",\"broadcast_deauth\":" + String(broadcastDeauth);
-  json += ",\"wps_probes\":" + String(wpsProbes);
-  json += ",\"eap_start_frames\":" + String(eapStartFrames);
-  json += ",\"duplicate_frames\":" + String(duplicateFrames);
-  json += ",\"fragmented_frames\":" + String(fragmentedFrames);
-  json += ",\"management_frames\":" + String(managementFrames);
-  json += ",\"data_frames\":" + String(dataFrames);
-  json += ",\"control_frames\":" + String(controlFrames);
-  json += ",\"attackers\":[";
-  
-  for (uint8_t i = 0; i < attackerCount; i++) {
-    if (i > 0) json += ",";
-    json += "{\"mac\":\"";
-    for (int j = 0; j < 6; j++) {
-      if (attackers[i].mac[j] < 16) json += "0";
-      json += String(attackers[i].mac[j], HEX);
-      if (j < 5) json += ":";
-    }
-    json += "\",\"deauth\":" + String(attackers[i].deauthSent);
-    json += ",\"probes\":" + String(attackers[i].probesSent);
-    json += ",\"eapol\":" + String(attackers[i].eapolSent);
-    json += ",\"arp\":" + String(attackers[i].arpSent);
-    json += ",\"beacons\":" + String(attackers[i].beaconsSent);
-    json += ",\"suspicious\":" + String(attackers[i].suspicious ? "true" : "false") + "}";
-  }
-  json += "]},\"devices\":[";
-  
+  json += "\"devices\":[";
   for (uint8_t i = 0; i < deviceCount; i++) {
     if (i > 0) json += ",";
-    json += "{\"ip\":\"" + String(WiFi.localIP()[0]) + "." + String(WiFi.localIP()[1]) + "." + 
-            String(WiFi.localIP()[2]) + "." + String(devices[i].ip) + "\",\"mac\":\"";
+    
+    json += "{\"ip\":\"" + String(localIP[0]) + "." + String(localIP[1]) + "." + 
+            String(localIP[2]) + "." + String(devices[i].ip) + "\",\"mac\":\"";
+    
     for (int j = 0; j < 6; j++) {
       if (devices[i].mac[j] < 16) json += "0";
       json += String(devices[i].mac[j], HEX);
       if (j < 5) json += ":";
     }
-    json += "\",\"type\":\"" + String(devices[i].type) + "\",\"primary_port\":" + String(devices[i].port);
+    
+    json += "\",\"type\":\"" + String(devices[i].type) + "\"";
+    json += ",\"primary_port\":" + String(devices[i].port);
+    
+    // ✅ PORTS NORMAUX
     json += ",\"open_ports\":[";
     for (uint8_t j = 0; j < devices[i].openPortCount; j++) {
       if (j > 0) json += ",";
       json += String(devices[i].openPorts[j]);
     }
-    json += "],\"open_port_count\":" + String(devices[i].openPortCount);
+    json += "]";
+    
+    // ✅ NOUVEAU : PORTS SUSPECTS
+    json += ",\"suspicious_ports\":[";
+    for (uint8_t j = 0; j < devices[i].suspiciousPortCount; j++) {
+      if (j > 0) json += ",";
+      json += String(devices[i].suspiciousPorts[j]);
+    }
+    json += "]";
+    
+    json += ",\"open_port_count\":" + String(devices[i].openPortCount);
+    json += ",\"suspicious_port_count\":" + String(devices[i].suspiciousPortCount);  // ✅ NOUVEAU
     json += ",\"scan_attempts\":" + String(devices[i].scanAttempts);
     json += ",\"last_seen\":" + String(devices[i].lastSeen) + "}";
   }
@@ -684,12 +718,13 @@ String buildJSON() {
 // ==================== ENVOI ====================
 void sendScanToPC(String json) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ WiFi KO!");
+    Serial.println("❌ WiFi non connecté!");
     return;
   }
   
   String url = "http://" + String(PC_IP) + ":" + String(PC_PORT) + "/scan";
-  Serial.printf("\n📤 POST %s | %d dev | %lu pkt\n", url.c_str(), deviceCount, totalPacketsCaptured);
+  Serial.printf("\n📤 Envoi vers %s\n", url.c_str());
+  Serial.printf("   📊 %d devices | %lu packets\n", deviceCount, totalPacketsCaptured);
   
   HTTPClient http;
   WiFiClient client;
@@ -699,10 +734,14 @@ void sendScanToPC(String json) {
   http.setTimeout(15000);
   
   int code = http.POST(json);
-  Serial.printf("📨 HTTP %d %s\n", code, code > 0 ? "✅" : "❌");
   
-  if (code == HTTP_CODE_OK || code == HTTP_CODE_CREATED) {
-    Serial.println("📥 " + http.getString());
+  if (code > 0) {
+    Serial.printf("✅ HTTP %d\n", code);
+    if (code == HTTP_CODE_OK || code == HTTP_CODE_CREATED) {
+      Serial.println("📥 " + http.getString());
+    }
+  } else {
+    Serial.printf("❌ Erreur HTTP: %s\n", http.errorToString(code).c_str());
   }
   
   http.end();
@@ -715,7 +754,7 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <head>
 <meta charset='UTF-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>ESP Pentest Detector v4.1</title>
+<title>ESP WiFi Security v6.2</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#1a1a2e,#16213e,#0f3460,#533483);color:#fff;padding:20px;min-height:100vh}
@@ -733,9 +772,9 @@ h1{background:linear-gradient(135deg,#ef5350,#ff6f00,#ff1744);-webkit-background
 .btn{display:block;width:100%;padding:20px;border:none;border-radius:12px;font-size:1.2em;font-weight:700;cursor:pointer;text-transform:uppercase;letter-spacing:1.5px;transition:all 0.3s;margin-bottom:15px}
 .btn:disabled{opacity:0.5;cursor:not-allowed}
 .btn-dashboard{background:linear-gradient(135deg,#00e676,#00c853);color:#1a1a2e;box-shadow:0 4px 20px rgba(0,230,118,0.4)}
-.btn-dashboard:hover{transform:translateY(-3px);box-shadow:0 8px 35px rgba(0,230,118,0.8)}
+.btn-dashboard:hover:not(:disabled){transform:translateY(-3px);box-shadow:0 8px 35px rgba(0,230,118,0.8)}
 .btn-primary{background:linear-gradient(135deg,#ff1744,#f50057);color:#fff;box-shadow:0 4px 20px rgba(255,23,68,0.4)}
-.btn-primary:hover{transform:translateY(-3px);box-shadow:0 8px 30px rgba(255,23,68,0.6)}
+.btn-primary:hover:not(:disabled){transform:translateY(-3px);box-shadow:0 8px 30px rgba(255,23,68,0.6)}
 .info-card{background:linear-gradient(135deg,rgba(30,30,50,0.95),rgba(20,20,40,0.9));padding:25px;border-radius:12px;border:1px solid rgba(239,83,80,0.3);margin-bottom:20px}
 .info-title{color:#ef5350;font-size:1.3em;font-weight:700;margin-bottom:15px}
 .info-item{padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.1);display:flex;justify-content:space-between}
@@ -748,8 +787,8 @@ h1{background:linear-gradient(135deg,#ef5350,#ff6f00,#ff1744);-webkit-background
 <body>
 <div class='container'>
 <div class='header'>
-<h1>🛡️ ESP PENTEST DETECTOR</h1>
-<div class='subtitle'>Détection WiFi automatique</div>
+<h1>🛡️ ESP WiFi Security v6.2</h1>
+<div class='subtitle'>Détection Ports Suspects</div>
 <div class='device-info'>
 <span class='info-badge'>📡 {{IP}}</span>
 <span class='info-badge'>📶 {{RSSI}} dBm</span>
@@ -773,10 +812,10 @@ h1{background:linear-gradient(135deg,#ef5350,#ff6f00,#ff1744);-webkit-background
 </div>
 
 <button class='btn btn-dashboard' onclick="location.href='http://{{SERVER}}'">
- DASHBOARD COMPLET
+📊 DASHBOARD PYTHON
 </button>
 <button class='btn btn-primary' onclick='scan()' id='btn'>
-SCAN MANUEL
+🔍 SCAN MANUEL
 </button>
 
 <div class='info-card'>
@@ -784,15 +823,7 @@ SCAN MANUEL
 <div class='info-item'><span class='info-key'>🌐 IP</span><span class='info-value'>{{IP}}</span></div>
 <div class='info-item'><span class='info-key'>📍 Réseau</span><span class='info-value'>{{NETWORK}}.0/24</span></div>
 <div class='info-item'><span class='info-key'>🖥️ Serveur</span><span class='info-value'>{{SERVER}}</span></div>
-<div class='info-item'><span class='info-key'>⏱️ Scan</span><span class='info-value'>{{DURATION}}s</span></div>
-</div>
-
-<div class='info-card'>
-<div class='info-title'>🎯 Détections disponibles</div>
-<div class='info-item'><span class='info-key'> Scan ARP</span><span class='info-value'>Cache persistant</span></div>
-<div class='info-item'><span class='info-key'>DDoS</span><span class='info-value'>Analyse trafic</span></div>
-<div class='info-item'><span class='info-key'>Pentest</span><span class='info-value'>Aireplay/Wash/MDK3</span></div>
-<div class='info-item'><span class='info-key'>Spoofing</span><span class='info-value'>ARP/MAC/MITM</span></div>
+<div class='info-item'><span class='info-key'>⏱️ Dernier scan</span><span class='info-value'>{{DURATION}}s</span></div>
 </div>
 </div>
 
@@ -801,14 +832,16 @@ function scan(){
 const b=document.getElementById('btn');
 if(b.disabled)return;
 b.disabled=true;
-b.textContent='⏳ SCAN (50s)...';
-fetch('/scan').then(()=>setTimeout(()=>location.reload(),50000)).catch(e=>{
-alert('❌ '+e);
+b.textContent='⏳ SCAN (90s)...';
+fetch('/scan').then(()=>{
+setTimeout(()=>location.reload(),90000);
+}).catch(e=>{
+alert('❌ Erreur: '+e);
 b.disabled=false;
-b.textContent='SCAN MANUEL';
+b.textContent='🔍 SCAN MANUEL';
 });
 }
-console.log('🛡️ ESP v4.1 | Auto-scan: 60s | Dashboard: http://{{SERVER}}');
+console.log('🛡️ ESP v6.2 | Détection Ports Suspects');
 </script>
 </body>
 </html>
@@ -838,9 +871,9 @@ void handleRoot() {
 }
 
 void handleScan() {
-  server.send(200, "text/plain", "Scan démarré");
+  server.send(200, "text/plain", "Scan en cours");
   performScan();
-  performPentestDetection();
+  performDDoSDetection();
   if (WiFi.status() == WL_CONNECTED) {
     sendScanToPC(buildJSON());
   }
@@ -851,15 +884,15 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\n╔════════════════════════════════╗");
-  Serial.println("║  ESP PENTEST DETECTOR v4.1     ║");
-  Serial.println("║  Optimisé + Filtre retry       ║");
-  Serial.println("╚════════════════════════════════╝\n");
+  Serial.println("\n╔════════════════════════════════════╗");
+  Serial.println("║   ESP WiFi Security                ║");
+  Serial.println("║   Détection Ports Suspects         ║");
+  Serial.println("╚════════════════════════════════════╝\n");
   
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASS);
   
-  Serial.print("📡 Connexion");
+  Serial.print("📡 Connexion WiFi");
   uint8_t tries = 0;
   while (WiFi.status() != WL_CONNECTED && tries < 30) {
     delay(500);
@@ -869,29 +902,29 @@ void setup() {
   Serial.println();
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("✅ WiFi OK!");
-    Serial.printf("📍 IP: %s\n", WiFi.localIP().toString().c_str());
+    Serial.println("✅ WiFi connecté!");
+    Serial.printf("📍 IP ESP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("📶 Signal: %d dBm\n", WiFi.RSSI());
-    Serial.printf("🖥️ Serveur: %s:%d\n\n", PC_IP, PC_PORT);
+    Serial.printf("🖥️ Serveur Python: %s:%d\n\n", PC_IP, PC_PORT);
     
     server.on("/", handleRoot);
     server.on("/scan", handleScan);
     server.begin();
     
-    Serial.println("🌐 Serveur actif");
+    Serial.println("🌐 Serveur web actif");
     Serial.println("🔗 http://" + WiFi.localIP().toString() + "\n");
     
     delay(2000);
     
-    Serial.println("🚀 Scan initial...\n");
+    Serial.println("🚀 Lancement scan initial...\n");
     performScan();
-    performPentestDetection();
+    performDDoSDetection();
     
     if (WiFi.status() == WL_CONNECTED) {
       sendScanToPC(buildJSON());
     }
   } else {
-    Serial.println("❌ WiFi KO!");
+    Serial.println("❌ Connexion WiFi échouée!");
   }
 }
 
@@ -904,13 +937,14 @@ void loop() {
   
   if (!scanning && !isSniffing && millis() - lastScan > 60000) {
     lastScan = millis();
-    Serial.println("\n⏰ Scan auto...");
+    Serial.println("\n⏰ Scan automatique...");
     performScan();
-    performPentestDetection();
+    performDDoSDetection();
+    
     if (WiFi.status() == WL_CONNECTED) {
       sendScanToPC(buildJSON());
     } else {
-      Serial.println("⚠️ Reconnect...");
+      Serial.println("⚠️ Tentative de reconnexion...");
       WiFi.reconnect();
     }
   }
